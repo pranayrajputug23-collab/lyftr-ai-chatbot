@@ -1,62 +1,49 @@
-# Lyftr AI Deployment Preparation
+# Lyftr AI: Vercel + EC2 Quick Tunnel Deployment
 
-This guide prepares the existing application for a FastAPI backend on AWS EC2 and a static React/Vite frontend on Vercel. It does not deploy either service. Replace every angle-bracket placeholder with your own value; never put a Groq key in source code, a Docker image, a Vercel variable, or a command that you might paste into a shared log.
+This guide uses Vercel for the React/Vite frontend, EC2 for the FastAPI Docker Compose backend, the existing SQLite Docker volume at `/data`, Groq for inference, and a Cloudflare Quick Tunnel for temporary HTTPS. It requires no custom domain and creates no resources automatically.
 
-## Deployment shape
+Quick Tunnels are temporary and intended for testing/development. The URL changes if recreated, has no uptime guarantee, and anyone with the URL can access the API. See [Cloudflare Quick Tunnel limitations](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
 
-- **Vercel project root:** `frontend/`. Vercel builds the Vite app and serves the static `dist/` output. `frontend/vercel.json` sets the build command, output directory, and SPA fallback.
-- **EC2:** Run only the backend image. Do not start the Compose `frontend` service on EC2. Uvicorn listens on `0.0.0.0:8000` in the container, but Docker publishes it only on the host loopback address (`127.0.0.1:8000`). A host reverse proxy terminates HTTPS and forwards requests to it.
-- **SQLite:** Attach a separate EBS volume and mount it on the EC2 host at `/srv/lyftr/data`. Bind-mount that directory into the backend as `/data`; the configured database URL is `sqlite:////data/app.db`.
-- **Secrets and configuration:** Store the comma-separated Groq keys in a root-owned, mode-600 environment file on EC2. The Docker image contains application code and dependencies only. `ENABLE_FAILURE_SIMULATION=false` in the server environment.
-- **Browser API URL:** Set Vercel's `VITE_API_BASE_URL` to the public HTTPS API origin, for example `https://<api-domain>`. This is a public URL, not a secret. Do not set it to `http://backend:8000` or `/api` for this direct EC2 setup.
+## Confirmed project behavior
 
-The existing backend already reads comma-separated exact origins from `ALLOWED_ORIGINS`, has a `/health` endpoint, and serves the API routes at `/chat` and `/sessions/...`. No API or application code changes are required for deployment. The existing Compose setup is for local development: `docker compose up -d backend` starts only its backend service, but the Compose named volume is not the explicit EC2 EBS mount described here. The `docker run` command below uses a host bind mount for that purpose.
+- `frontend/src/api.js` reads `VITE_API_BASE_URL`, trims a trailing slash, and calls `<base>/chat`. It accepts a public HTTPS URL and does not hardcode a Docker hostname.
+- FastAPI reads comma-separated `ALLOWED_ORIGINS` and uses exact CORS origin matching. Use the Vercel Production URL including `https://`, with no path or trailing slash.
+- Uvicorn listens on `0.0.0.0:8000` inside the backend container. Compose publishes it as `127.0.0.1:8000:8000`, so `cloudflared` on EC2 can reach it but direct internet clients cannot.
+- Compose's named volume `lyftr_ai_sqlite_data` mounts at `/data`; the database URL is `sqlite:////data/app.db`. Docker stores that volume on the EC2 EBS-backed root filesystem. It survives container replacement and `docker compose down` without `-v`, plus EC2 stop/start. Never run `docker compose down -v` or remove the volume. Before terminating the instance, snapshot or preserve the root disk; termination can delete it.
+- `docker compose up --build -d backend` starts only the backend; no EC2 frontend container is needed.
 
-## 1. Check AWS account and estimate costs
+## Before starting
 
-1. Sign in to the AWS account and choose the region closest to your users and supported by your desired instance type.
-2. Before creating resources, review **Billing and Cost Management**, configure a budget alert, and use the [AWS Pricing Calculator](https://calculator.aws/) for your chosen region and expected monthly uptime.
-3. Estimate at least:
-   - EC2 instance hours and the selected CPU/memory size. LiteLLM calls Groq over the network, but the API and SQLite still need enough memory and disk I/O for your request volume.
-   - EBS gp3 capacity and any provisioned performance beyond its included baseline; snapshots add storage charges.
-   - Public IPv4 address charges, including an Elastic IP if you reserve one. An address makes DNS stable across instance stops/replacements.
-   - Internet data transfer, DNS/domain registration, and optional load balancer or monitoring charges.
-   - Groq model usage, which is billed separately by Groq and depends on token volume and its current pricing.
-   - Vercel plan and usage. Vercel currently lists Hobby at $0/month for personal projects and Pro at $20/month plus usage rules; check the current [Vercel pricing](https://vercel.com/pricing) and plan eligibility before choosing.
+Create the EC2 instance and Vercel project manually. Use Ubuntu 24.04 LTS and an EBS-backed root disk with enough capacity for Docker images and chat history. Retain or snapshot the disk before terminating the instance.
 
-AWS prices vary by region, instance type, storage, and usage. Confirm estimates in the calculator and pricing pages immediately before creating resources. Relevant references: [EC2 pricing](https://aws.amazon.com/ec2/pricing/on-demand/), [VPC public IPv4 pricing](https://aws.amazon.com/vpc/pricing/), and [Vercel plans](https://vercel.com/docs/plans).
+EC2 security group inbound rules:
 
-## 2. Create the EC2 instance and network rules
+| Port | Source | Reason |
+| --- | --- | --- |
+| TCP 22 | Your current public IP `/32` | SSH administration |
+| No other inbound ports | — | Tunnel is initiated outbound; do not open 8000, 80, or 443 |
 
-In the AWS Console, select **EC2 → Launch instance**:
+Leave outbound internet access enabled for Ubuntu packages, Groq, and Cloudflare. Cloudflare Tunnel uses outbound UDP or TCP port `7844`; UDP is preferred and TCP is the fallback. See [Cloudflare tunnel firewall requirements](https://developers.cloudflare.com/tunnel/configuration/).
 
-1. Choose an Ubuntu Server 24.04 LTS AMI, select an instance architecture/type that fits your budget and expected load, and create or select a key pair. Download and protect the private key; AWS does not provide it again.
-2. Configure an EBS root disk and a separate EBS data volume for SQLite. Choose a data size based on expected chat history and backup retention. Keep the data volume in the same Availability Zone as the instance.
-3. Create or select a security group with these inbound rules:
+## Commands and steps in execution order
 
-   | Port | Source | Purpose |
-   | --- | --- | --- |
-   | TCP 22 | Your current public IP `/32` only | SSH administration |
-   | TCP 80 | `0.0.0.0/0` (and `::/0` if using IPv6) | Optional HTTP redirect and certificate validation/renewal |
-   | TCP 443 | `0.0.0.0/0` (and `::/0` if using IPv6) | Public HTTPS API |
+### 1. Connect to EC2
 
-   Do not add a public inbound rule for port 8000. If your IP changes, update the SSH source rule to your new IP; do not open SSH to `0.0.0.0/0`. AWS recommends restricting SSH to known addresses in its [security group guidance](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/creating-security-group.html).
-4. Allocate and associate a static public IPv4 address if you need a stable DNS target. Review its current price before reserving it.
-5. Attach the separate EBS data volume. Take note of its availability zone and size.
-
-## 3. Connect and install Docker
-
-From Windows PowerShell, connect using the downloaded key path and the instance public IP or static address:
+From Windows PowerShell, replace the key path and address with your instance values:
 
 ```powershell
 ssh -i "C:\path\to\your-key.pem" ubuntu@<EC2_PUBLIC_IP>
 ```
 
-On the Ubuntu instance, install Docker Engine and the Compose plugin using Docker's maintained [Ubuntu installation instructions](https://docs.docker.com/engine/install/ubuntu/). The following is the current repository-based approach; review Docker's page if package steps change:
+Run remaining shell commands in the EC2 SSH session.
+
+### 2. Install Docker Engine and Compose plugin
+
+Use Docker's official Ubuntu repository:
 
 ```bash
 sudo apt update
-sudo apt install -y ca-certificates curl
+sudo apt install -y ca-certificates curl git
 sudo install -m 0755 -d /etc/apt/keyrings
 sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 sudo chmod a+r /etc/apt/keyrings/docker.asc
@@ -74,229 +61,162 @@ sudo systemctl enable --now docker
 sudo docker run --rm hello-world
 ```
 
-These commands install Docker from its official apt repository. Keep Docker Engine updated. Membership in the `docker` group grants root-equivalent control of the machine; use `sudo docker` unless you consciously accept that privilege.
+Reference: [Install Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/).
 
-## 4. Mount persistent SQLite storage
+### 3. Get the project onto EC2
 
-The EC2 instance's container filesystem is not a suitable place for the production database. Mount the separate EBS disk on the host and bind-mount it into the backend. **Only format a brand-new, empty data volume. Formatting an existing volume erases its contents.** Confirm the target device and filesystem first:
-
-```bash
-lsblk -f
-```
-
-For a new empty volume only, substitute the actual device shown by `lsblk` (Nitro instances often use an NVMe name):
+Replace the repository placeholder with your GitHub clone URL. For a private repository, configure SSH access or another approved source download method first.
 
 ```bash
-sudo mkfs.ext4 /dev/<verified-new-volume-device>
-sudo mkdir -p /srv/lyftr/data
-sudo mount /dev/<verified-new-volume-device> /srv/lyftr/data
+cd /opt
+sudo git clone https://github.com/<OWNER>/<REPOSITORY>.git lyftr-ai
+sudo chown -R ubuntu:ubuntu /opt/lyftr-ai
+cd /opt/lyftr-ai
 ```
 
-The backend image runs as a non-root `app` user. After building the image in the next section, read its numeric UID and GID, then grant that account access to the mount:
+These commands download the existing project; they do not commit or push.
 
-```bash
-docker run --rm --entrypoint id lyftr-ai-backend:production -u
-docker run --rm --entrypoint id lyftr-ai-backend:production -g
-sudo chown <APP_UID>:<APP_GID> /srv/lyftr/data
-sudo chmod 0750 /srv/lyftr/data
-```
-
-Configure the volume to mount after reboot using its UUID, not an assumed device name. Find it with `sudo blkid /dev/<verified-new-volume-device>`, then add the corresponding line to `/etc/fstab`:
-
-```text
-UUID=<volume-filesystem-uuid> /srv/lyftr/data ext4 defaults,nofail 0 2
-```
-
-Verify the entry before rebooting:
-
-```bash
-sudo mount -a
-df -h /srv/lyftr/data
-```
-
-AWS recommends UUID-based entries for automatic EBS mounting; see [Make an EBS volume available for use](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-using-volumes.html). Back up SQLite and take EBS snapshots on a schedule. An EBS volume is durable storage for this instance, but it does not by itself provide multi-instance availability.
-
-## 5. Build and start only the backend
-
-Obtain the project source on the EC2 instance from the repository or a reviewed release artifact. Keep it in a directory such as `/opt/lyftr-ai`. Build only the backend image from the project root; its Dockerfile copies `backend/app` and installs `backend/requirements.txt`:
+Because the repository change in this workspace is intentionally not being pushed, update the cloned Compose file on EC2 to bind port 8000 to loopback. This one-line edit keeps the backend reachable to the local tunnel but not directly through EC2's network interfaces:
 
 ```bash
 cd /opt/lyftr-ai
-sudo docker build -f backend/Dockerfile -t lyftr-ai-backend:production .
+sed -i 's/"8000:8000"/"127.0.0.1:8000:8000"/' docker-compose.yml
+grep -n '127.0.0.1:8000:8000' docker-compose.yml
 ```
 
-Create a protected environment file. Do not place real keys in a command line, checked-in file, or Docker build argument:
+### 4. Create the Vercel project and get its Production URL
+
+In Vercel, import the GitHub repository and set **Root Directory** to `frontend`. In Build Settings, use Install Command `npm ci`, Build Command `npm run build`, and Output Directory `dist` (Framework Preset: Vite). Deploy once so Vercel assigns the stable Production URL, such as `https://<project>.vercel.app`. The frontend builds before its API URL is configured, but chat remains unavailable until Step 9. The current app has no client-side deep routes, so it does not require an SPA rewrite for this deployment.
+
+Use the stable Production URL for CORS, not a Preview URL. Complete this step before editing `.env` on EC2.
+
+### 5. Configure backend environment safely
+
+On EC2, create the root `.env` from its placeholder example and restrict its permissions:
 
 ```bash
-sudo install -d -m 0750 /etc/lyftr
-sudo install -m 0600 /dev/null /etc/lyftr/backend.env
-sudo nano /etc/lyftr/backend.env
+cd /opt/lyftr-ai
+cp .env.example .env
+chmod 600 .env
+nano .env
 ```
 
-Enter these settings in the editor, replacing placeholders locally. Put both Groq keys in `LLM_API_KEYS`, comma-separated, with no spaces required. Add the exact Vercel production origin after the first Vercel deployment has assigned its stable production domain:
+In the editor, set the following values. Type both actual Groq keys directly into the EC2 editor as a comma-separated list; never place them in a command, Vercel, or a message. Replace the Vercel URL with the exact Production URL from Step 4.
 
 ```dotenv
 LLM_PROVIDER=groq
 LLM_MODEL=groq/openai/gpt-oss-120b
 LLM_API_KEYS=<GROQ_KEY_1>,<GROQ_KEY_2>
 DATABASE_URL=sqlite:////data/app.db
-ALLOWED_ORIGINS=https://<your-production-project>.vercel.app
+ALLOWED_ORIGINS=https://<project>.vercel.app
 ENABLE_FAILURE_SIMULATION=false
 CACHE_ENABLED=true
 LITELLM_CACHE_TYPE=local
 ```
 
-If you add a custom Vercel domain, include each exact allowed origin as a comma-separated item, such as `https://<project>.vercel.app,https://<your-custom-domain>`. Origins include the scheme and hostname, and must not include a path. Do not use `*`. The backend parses these as explicit origins; the CORS code does not need a change.
+Save and exit `nano` with **Ctrl+O**, Enter, then **Ctrl+X**. `.env` is ignored by Git and excluded from Docker build context. Never run `cat .env`, `docker compose config` without `--quiet`, or a full environment inspection; those can expose secrets.
 
-Start the backend with a host bind mount for the EBS-backed directory. Binding to `127.0.0.1` means only the host reverse proxy can reach port 8000; the public security group does not expose it:
+### 6. Start only the backend
 
-```bash
-sudo docker run -d \
-  --name lyftr-ai-backend \
-  --restart unless-stopped \
-  --env-file /etc/lyftr/backend.env \
-  --publish 127.0.0.1:8000:8000 \
-  --mount type=bind,src=/srv/lyftr/data,dst=/data \
-  --health-cmd='python -c "import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/health\", timeout=3)"' \
-  --health-interval=30s --health-timeout=5s --health-retries=3 --health-start-period=20s \
-  lyftr-ai-backend:production
-```
-
-The image starts Uvicorn on `0.0.0.0:8000` inside the container, as required for Docker networking. Docker's host binding limits access to the host loopback interface. The `unless-stopped` policy restarts the backend after Docker/EC2 restarts. Only the backend is started; no frontend container is needed.
-
-Check container status without printing environment variables:
+Build and start only the backend. This uses the existing named volume mounted at `/data` and leaves Compose's frontend stopped:
 
 ```bash
-sudo docker ps --filter name=lyftr-ai-backend
-sudo docker inspect --format '{{.State.Health.Status}}' lyftr-ai-backend
+cd /opt/lyftr-ai
+sudo docker compose up --build -d backend
+sudo docker compose ps
+sudo docker compose exec -T backend python -c "import os; print(os.path.isfile('/data/app.db'))"
 curl -i http://127.0.0.1:8000/health
 ```
 
-The health endpoint returns 200 when SQLite is reachable and at least one key is configured. It returns 503 if no key is configured; health does not verify that Groq accepts the keys. Do not paste environment values or full container environment inspection output into support tickets.
+Health should return HTTP 200 and `status: ok` when SQLite is writable and a key is configured. If health returns 503, verify `.env` in the editor without copying its contents into chat. Compose restarts the backend with `unless-stopped`; Docker is enabled at EC2 boot.
 
-## 6. Add HTTPS with a domain and reverse proxy
+The named volume resides on the EC2 EBS-backed root disk. Container rebuilds and `docker compose down` preserve it. Do not add `-v` to `docker compose down`.
 
-Choose a domain you control, create an `A` record such as `api.<your-domain>` pointing at the EC2 static public IP, and wait for DNS to resolve. Install a host-level reverse proxy and certificate tool:
+### 7. Install `cloudflared`
 
-```bash
-sudo apt update
-sudo apt install -y nginx certbot python3-certbot-nginx
-```
-
-Create an Nginx site, replacing the example hostname with your API domain:
+Install from Cloudflare's official Debian/Ubuntu package repository:
 
 ```bash
-sudo tee /etc/nginx/sites-available/lyftr-api >/dev/null <<'EOF'
-server {
-    listen 80;
-    server_name api.<your-domain>;
-
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-EOF
-sudo ln -s /etc/nginx/sites-available/lyftr-api /etc/nginx/sites-enabled/lyftr-api
-sudo nginx -t
-sudo systemctl reload nginx
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update
+sudo apt-get install -y cloudflared
+cloudflared --version
 ```
 
-Request a certificate after DNS resolves and the security group allows inbound port 80:
+Reference: [Cloudflare's Linux package instructions](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/create-local-tunnel/).
+
+### 8. Start the Quick Tunnel and copy its URL
+
+Run this in the EC2 SSH terminal and leave it running:
 
 ```bash
-sudo certbot --nginx -d api.<your-domain>
-sudo certbot renew --dry-run
+cloudflared tunnel --url http://127.0.0.1:8000
 ```
 
-Certbot configures TLS and renewal for Nginx. Configure the proxy to:
+Copy the generated URL, which looks like `https://random-words.trycloudflare.com`. Do not close this SSH terminal while using the app; stopping the process stops the public URL. Open a second SSH terminal for verification.
 
-1. Listen publicly on ports 80 and 443 for the API domain.
-2. Redirect HTTP to HTTPS and renew the TLS certificate automatically.
-3. Forward HTTPS requests to `http://127.0.0.1:8000` and preserve the `Host` and `X-Forwarded-For` headers.
-4. Keep port 8000 private to the host. Do not publish it on `0.0.0.0` or add it to the EC2 security group.
+Quick Tunnels have no uptime guarantee, the hostname changes when recreated, and anyone with the URL can reach the API. The current chat API has no authentication or rate limiting. Treat this as a temporary assignment/demo endpoint and stop it when finished. Cloudflare documents a 200 in-flight request limit and no Server-Sent Events support; this app's chat flow does not use SSE.
 
-For Nginx, the core upstream directive is `proxy_pass http://127.0.0.1:8000;` inside the matching `location /` block. Use an HTTPS certificate from a trusted certificate authority; do not send the frontend's API requests over plain HTTP. An AWS load balancer with a managed certificate is another option, but it adds AWS resources and charges. The required Vercel CORS origin is still the Vercel frontend origin, even when a proxy terminates TLS.
+### 9. Set Vercel's API URL and redeploy
 
-## 7. Import the frontend into Vercel
+In Vercel, open **Project → Settings → Environment Variables** and add:
 
-1. In Vercel, choose **Add New → Project**, connect the GitHub account/repository, and import the Lyftr AI repository.
-2. Set **Root Directory** to `frontend` and confirm Vercel uses that folder. The included `frontend/vercel.json` specifies `npm run build`, `dist`, and the SPA fallback to `index.html`; dependencies come from `frontend/package.json` and its lockfile.
-3. In **Project Settings → Environment Variables**, add:
+```text
+Name:  VITE_API_BASE_URL
+Value: https://random-words.trycloudflare.com
+For:   Production
+```
 
-   | Name | Value | Environment |
-   | --- | --- | --- |
-   | `VITE_API_BASE_URL` | `https://<your-api-domain>` | Production (and Preview only if that preview origin is allowed by backend CORS) |
+Use the actual URL from Step 8 with no trailing slash, then save and redeploy Production. The browser calls the public HTTPS URL directly. Do not set `http://backend:8000`, `localhost`, or `/api`. Vite embeds `VITE_` variables in browser code, so this must contain only the public backend URL—never a Groq key.
 
-   Use the actual HTTPS API origin, with no Docker hostname and no Groq key. Vite embeds `VITE_` variables into browser code, so this variable must contain only the public API base URL. The app appends `/chat` and session history paths to it.
-4. Deploy the project. Once Vercel assigns the production URL, set that exact origin in the EC2 `ALLOWED_ORIGINS` file. Restart the backend to load the updated environment:
+### 10. Verify health, chat, history, and CORS
 
-   ```bash
-   sudo docker rm -f lyftr-ai-backend
-   # Re-run the docker run command from the previous section with the same
-   # image, env file, health settings, and /srv/lyftr/data bind mount.
-   ```
-
-   `docker rm -f` removes only the container; it does not remove the host data directory. Confirm the new container is healthy before testing the frontend. Update Vercel's variable and redeploy if the API domain changes; Vercel applies build variables to new deployments.
-
-Vercel's official [Vite deployment guide](https://vercel.com/docs/frameworks/frontend/vite) documents `VITE_` build variables and SPA rewrites. The explicit rewrite in `frontend/vercel.json` is ready for deep links if the frontend later adds client-side routes.
-
-## 8. Verify public endpoints
-
-After DNS, TLS, and CORS are configured:
+In the second EC2 SSH session, replace the placeholder with the current URL:
 
 ```bash
-curl -i https://<your-api-domain>/health
+TUNNEL_URL=https://random-words.trycloudflare.com
+curl -i "$TUNNEL_URL/health"
 ```
 
-With keys configured and the database reachable, expect HTTP 200 with `status: ok`. The Vercel site should load over HTTPS. Send a chat message through the UI and check the browser developer tools' Network panel: the request should go to `https://<your-api-domain>/chat`, receive a successful response, and show no CORS or mixed-content error. The browser must never request `backend:8000`.
-
-For a CORS preflight check, substitute the exact Vercel origin:
+Send one harmless chat request:
 
 ```bash
-curl -i -X OPTIONS 'https://<your-api-domain>/chat' \
-  -H 'Origin: https://<your-production-project>.vercel.app' \
-  -H 'Access-Control-Request-Method: POST' \
-  -H 'Access-Control-Request-Headers: content-type'
+curl -i -X POST "$TUNNEL_URL/chat" \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: https://<project>.vercel.app' \
+  -d '{"session_id":"assignment-smoke-001","message":"Reply with exactly: deployment ready"}'
 ```
 
-The response should include an `Access-Control-Allow-Origin` matching that exact origin. Do not use the Groq key in a frontend request.
-
-## 9. Update, rollback, and troubleshoot
-
-For an update, build a new tagged image (for example `lyftr-ai-backend:<release>`), then stop and remove the old container and start the new image using the same environment file and EBS bind mount. Keep the prior image tag until the new version passes health and chat checks. To roll back, recreate the container using the prior image tag and the same `/etc/lyftr/backend.env` and `/srv/lyftr/data` mount. Never remove `/srv/lyftr/data` during a code rollback.
-
-Useful diagnostics that do not print the environment file:
+Read the saved conversation with the same session ID:
 
 ```bash
-sudo docker ps -a --filter name=lyftr-ai-backend
-sudo docker logs --tail 100 lyftr-ai-backend
-sudo docker inspect --format '{{.State.Health.Status}}' lyftr-ai-backend
-df -h /srv/lyftr/data
-sudo ls -ld /srv/lyftr/data
-sudo systemctl status docker
+curl -i "$TUNNEL_URL/sessions/assignment-smoke-001/messages"
 ```
 
-- **Container exits or is unhealthy:** inspect recent application logs and `docker inspect` health status. Verify the env file's permissions and variable names without copying its contents into a chat or ticket.
-- **Health returns 503:** confirm the data volume is mounted and writable and that `LLM_API_KEYS` contains keys; health does not validate keys with Groq.
-- **SQLite “readonly” or permission errors:** check that the correct EBS volume is mounted at `/srv/lyftr/data` and the directory is writable by the container image's numeric app UID/GID.
-- **Vercel reports API network/CORS errors:** check that the Vercel variable is the public `https://` API origin, the reverse proxy forwards `/chat` to the backend, port 443 is reachable, and `ALLOWED_ORIGINS` exactly matches the deployed Vercel origin. Redeploy Vercel after changing its environment variable.
-- **TLS certificate fails:** verify the DNS record points to the public address and inbound ports 80/443 reach the host proxy.
-- **History disappeared after a replacement:** check `findmnt /srv/lyftr/data`, `df -h /srv/lyftr/data`, the container bind mount, and that the EBS volume was reattached. Restore from a verified backup or EBS snapshot if needed.
-- **Unexpected provider failures:** verify the selected Groq model and key validity/quota using the backend logs and Groq account. Never print keys while debugging.
+Finally, open the Vercel Production URL and send a chat message. In browser Developer Tools → **Network**, confirm the request goes to the `trycloudflare.com` HTTPS URL, `/chat` succeeds, and no CORS or mixed-content error appears. CORS must match the Vercel URL exactly. A Vercel Preview hostname is blocked unless you add that exact origin to `ALLOWED_ORIGINS` and recreate the backend.
 
-## Security and service limits
+## Restart and preserve data
 
-- Root `.env` and other environment files are ignored by Git and excluded from Docker build contexts. Keep production keys only in the protected EC2 environment file or a managed secret store. Do not put Groq keys in Vercel.
-- CORS is an exact origin allowlist. Add the production Vercel origin and any custom frontend domain explicitly; preview origins need their own exact entries if they must call production.
-- Restrict SSH to your IP, expose only HTTPS publicly (and HTTP only for redirects/certificate validation), and keep backend port 8000 bound to host loopback.
-- The current chat API has no user authentication or application-level rate limiting. Before inviting the public, add an abuse-control plan (for example authentication and rate limits at a trusted proxy/API gateway) and monitor Groq usage; otherwise anyone who can reach the endpoint may trigger model usage and costs.
-- SQLite with one EC2 instance is a single-node design. Keep automated backups and snapshots and test restoration. Use maintenance windows for disk changes and database upgrades.
+To reload changed environment values, recreate only the backend; the named volume is preserved:
 
-## Not deployed
+```bash
+cd /opt/lyftr-ai
+sudo docker compose up -d --force-recreate backend
+```
 
-No AWS or Vercel resources have been created by this preparation. The backend and frontend remain local until you complete the manual steps above, configure your real domains and secrets, and verify the public endpoints.
+If the tunnel process restarts, its URL may change. Update `VITE_API_BASE_URL` in Vercel and redeploy. Never run `docker compose down -v` or `docker volume rm`.
+
+Confirm the volume and database file without showing environment values:
+
+```bash
+sudo docker volume inspect lyftr_ai_sqlite_data --format '{{.Mountpoint}}'
+sudo docker compose exec -T backend python -c "import os; print('database_present:', os.path.isfile('/data/app.db'))"
+```
+
+## Changes and deployment status
+
+- `docker-compose.yml`: backend host port now binds to loopback only (`127.0.0.1:8000:8000`). The internal Uvicorn listener and API contract are unchanged.
+- `docs/deployment.md`: replaced domain/reverse-proxy instructions with this Quick Tunnel procedure.
+- No AWS or Vercel resources have been created, and nothing has been deployed automatically.
